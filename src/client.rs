@@ -50,7 +50,7 @@ pub use helper::*;
 use scrap::{
     codec::Decoder,
     record::{Recorder, RecorderContext},
-    ImageFormat,
+    ImageFormat, ImageRgb,
 };
 
 use crate::common::{self, is_keyboard_mode_supported};
@@ -165,6 +165,7 @@ impl OboePlayer {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn is_null(&self) -> bool {
         self.raw.is_null()
     }
@@ -753,6 +754,7 @@ pub struct AudioHandler {
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     audio_stream: Option<Box<dyn StreamTrait>>,
     channels: u16,
+    device_channel: u16,
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     ready: Arc<std::sync::Mutex<bool>>,
 }
@@ -825,22 +827,33 @@ impl AudioHandler {
         let sample_format = config.sample_format();
         log::info!("Default output format: {:?}", config);
         log::info!("Remote input format: {:?}", format0);
-        let mut config: StreamConfig = config.into();
-        config.channels = format0.channels as _;
-        match sample_format {
-            cpal::SampleFormat::I8 => self.build_output_stream::<i8>(&config, &device)?,
-            cpal::SampleFormat::I16 => self.build_output_stream::<i16>(&config, &device)?,
-            cpal::SampleFormat::I32 => self.build_output_stream::<i32>(&config, &device)?,
-            cpal::SampleFormat::I64 => self.build_output_stream::<i64>(&config, &device)?,
-            cpal::SampleFormat::U8 => self.build_output_stream::<u8>(&config, &device)?,
-            cpal::SampleFormat::U16 => self.build_output_stream::<u16>(&config, &device)?,
-            cpal::SampleFormat::U32 => self.build_output_stream::<u32>(&config, &device)?,
-            cpal::SampleFormat::U64 => self.build_output_stream::<u64>(&config, &device)?,
-            cpal::SampleFormat::F32 => self.build_output_stream::<f32>(&config, &device)?,
-            cpal::SampleFormat::F64 => self.build_output_stream::<f64>(&config, &device)?,
-            f => bail!("unsupported audio format: {:?}", f),
-        }
+        let config: StreamConfig = config.into();
         self.sample_rate = (format0.sample_rate, config.sample_rate.0);
+        let mut build_output_stream = |config: StreamConfig| match sample_format {
+            cpal::SampleFormat::I8 => self.build_output_stream::<i8>(&config, &device),
+            cpal::SampleFormat::I16 => self.build_output_stream::<i16>(&config, &device),
+            cpal::SampleFormat::I32 => self.build_output_stream::<i32>(&config, &device),
+            cpal::SampleFormat::I64 => self.build_output_stream::<i64>(&config, &device),
+            cpal::SampleFormat::U8 => self.build_output_stream::<u8>(&config, &device),
+            cpal::SampleFormat::U16 => self.build_output_stream::<u16>(&config, &device),
+            cpal::SampleFormat::U32 => self.build_output_stream::<u32>(&config, &device),
+            cpal::SampleFormat::U64 => self.build_output_stream::<u64>(&config, &device),
+            cpal::SampleFormat::F32 => self.build_output_stream::<f32>(&config, &device),
+            cpal::SampleFormat::F64 => self.build_output_stream::<f64>(&config, &device),
+            f => bail!("unsupported audio format: {:?}", f),
+        };
+        if config.channels > format0.channels as _ {
+            let no_rechannel_config = StreamConfig {
+                channels: format0.channels as _,
+                ..config.clone()
+            };
+            if let Err(_) = build_output_stream(no_rechannel_config) {
+                build_output_stream(config)?;
+            }
+        } else {
+            build_output_stream(config)?;
+        }
+
         Ok(())
     }
 
@@ -884,20 +897,25 @@ impl AudioHandler {
                     let sample_rate0 = self.sample_rate.0;
                     let sample_rate = self.sample_rate.1;
                     let audio_buffer = self.audio_buffer.0.clone();
+                    let mut buffer = buffer[0..n].to_owned();
                     if sample_rate != sample_rate0 {
-                        let buffer = crate::resample_channels(
+                        buffer = crate::audio_resample(
                             &buffer[0..n],
                             sample_rate0,
                             sample_rate,
                             channels,
                         );
-                        audio_buffer.lock().unwrap().push_slice_overwrite(&buffer);
-                    } else {
-                        audio_buffer
-                            .lock()
-                            .unwrap()
-                            .push_slice_overwrite(&buffer[0..n]);
                     }
+                    if self.channels != self.device_channel {
+                        buffer = crate::audio_rechannel(
+                            buffer,
+                            sample_rate,
+                            sample_rate,
+                            self.channels,
+                            self.device_channel,
+                        );
+                    }
+                    audio_buffer.lock().unwrap().push_slice_overwrite(&buffer);
                 }
                 #[cfg(target_os = "android")]
                 {
@@ -920,6 +938,7 @@ impl AudioHandler {
         config: &StreamConfig,
         device: &Device,
     ) -> ResultType<()> {
+        self.device_channel = config.channels;
         let err_fn = move |err| {
             // too many errors, will improve later
             log::trace!("an error occurred on stream: {}", err);
@@ -961,7 +980,7 @@ impl AudioHandler {
 /// Video handler for the [`Client`].
 pub struct VideoHandler {
     decoder: Decoder,
-    pub rgb: Vec<u8>,
+    pub rgb: ImageRgb,
     recorder: Arc<Mutex<Option<Recorder>>>,
     record: bool,
 }
@@ -971,7 +990,7 @@ impl VideoHandler {
     pub fn new() -> Self {
         VideoHandler {
             decoder: Decoder::new(),
-            rgb: Default::default(),
+            rgb: ImageRgb::new(ImageFormat::ARGB, crate::DST_STRIDE_RGBA),
             recorder: Default::default(),
             record: false,
         }
@@ -982,11 +1001,7 @@ impl VideoHandler {
     pub fn handle_frame(&mut self, vf: VideoFrame) -> ResultType<bool> {
         match &vf.union {
             Some(frame) => {
-                let res = self.decoder.handle_video_frame(
-                    frame,
-                    (ImageFormat::ARGB, crate::DST_STRIDE_RGBA),
-                    &mut self.rgb,
-                );
+                let res = self.decoder.handle_video_frame(frame, &mut self.rgb);
                 if self.record {
                     self.recorder
                         .lock()
@@ -1738,7 +1753,7 @@ pub fn start_video_audio_threads<F>(
     Arc<AtomicUsize>,
 )
 where
-    F: 'static + FnMut(&mut Vec<u8>) + Send,
+    F: 'static + FnMut(&mut scrap::ImageRgb) + Send,
 {
     let (video_sender, video_receiver) = mpsc::channel::<MediaData>();
     let video_queue = Arc::new(ArrayQueue::<VideoFrame>::new(VIDEO_QUEUE_SIZE));
